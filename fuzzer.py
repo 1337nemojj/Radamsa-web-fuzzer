@@ -5,6 +5,8 @@ import argparse
 import time
 import os
 import json
+import sys
+import hashlib
 
 # Global counters
 stats = {
@@ -15,11 +17,18 @@ stats = {
 }
 
 crash_dir = "crashes"
+log_dir = "logs"
 os.makedirs(crash_dir, exist_ok=True)
+os.makedirs(log_dir, exist_ok=True)
+
+MAX_TESTS_WITHOUT_CRASH = 100000
+seen_responses = set()
+
+log_file_path = os.path.join(log_dir, "fuzz_debug.log")
+log_file = open(log_file_path, "a", encoding="utf-8")
 
 
 async def generate_fuzz_input(original_input: str) -> str:
-    """Uses Radamsa to generate fuzzed input."""
     try:
         proc = await asyncio.create_subprocess_exec(
             "radamsa",
@@ -29,13 +38,13 @@ async def generate_fuzz_input(original_input: str) -> str:
         stdout, _ = await proc.communicate(input=original_input.encode())
         return stdout.decode("latin-1")
     except Exception as e:
+        print(f"[ERROR] Failed to generate fuzz input: {e}")
         return None
 
 
 async def send_request(session, url, method, headers, data):
     try:
         start_time = time.time()
-
         content_type = headers.get("Content-Type", "")
         if method.upper() == "GET":
             async with session.get(url, headers=headers, params=data) as resp:
@@ -47,7 +56,7 @@ async def send_request(session, url, method, headers, data):
                 try:
                     parsed_data = json.loads(data)
                 except:
-                    parsed_data = data  # fallback
+                    parsed_data = data
                 async with session.post(url, headers=headers, json=parsed_data) as resp:
                     status = resp.status
                     text = await resp.text()
@@ -59,10 +68,10 @@ async def send_request(session, url, method, headers, data):
                     resp_headers = dict(resp.headers)
         else:
             return None, 0, "", {}
-
         end_time = time.time()
         return status, end_time - start_time, text, resp_headers
     except Exception as e:
+        print(f"[ERROR] Request exception: {e}")
         return None, 0, f"[EXCEPTION] {str(e)}", {}
 
 
@@ -81,8 +90,26 @@ async def fuzzer_worker(session, args):
             if not fuzzed:
                 continue
 
-            status, response_time, response_text, response_headers = await send_request(session, args.url, args.method, args.headers, fuzzed)
+            status, response_time, response_text, response_headers = await send_request(
+                session, args.url, args.method, args.headers, fuzzed)
+
             stats['tests_run'] += 1
+
+            body_hash = hashlib.sha256(response_text.encode("utf-8")).hexdigest()
+            if body_hash not in seen_responses:
+                seen_responses.add(body_hash)
+                log_file.write("\n=== UNIQUE RESPONSE DETECTED ===\n")
+                log_file.write(f"Time: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                log_file.write(f"Status: {status}\n")
+                log_file.write(f"Response Time: {response_time:.4f} sec\n")
+                log_file.write("Headers:\n")
+                for k, v in response_headers.items():
+                    log_file.write(f"  {k}: {v}\n")
+                log_file.write("\nRequest Sent:\n")
+                log_file.write(fuzzed + "\n")
+                log_file.write("\nResponse Body:\n")
+                log_file.write(response_text + "\n")
+                log_file.flush()
 
             if check_for_crash(status, response_text):
                 stats['crashes_found'] += 1
@@ -97,12 +124,29 @@ async def fuzzer_worker(session, args):
                     f.write(f"\nFuzzed Input:\n{fuzzed}\n")
                     f.write(f"\nResponse Body:\n{response_text}")
 
-            # Optional periodic console update
-            if stats['tests_run'] % 100 == 0:
-                elapsed = time.time() - stats['start_time']
-                print(f"[INFO] Tests: {stats['tests_run']} | Crashes: {stats['crashes_found']} | Rate: {stats['tests_run']/elapsed:.2f} t/s")
+            if stats['tests_run'] >= MAX_TESTS_WITHOUT_CRASH and stats['crashes_found'] == 0:
+                print("\n[INFO] 100,000 tests completed without a single crash. Stopping fuzzer.")
+                for task in asyncio.all_tasks():
+                    task.cancel()
 
             await asyncio.sleep(0.01)
+    except asyncio.CancelledError:
+        return
+
+
+async def live_stats_updater():
+    try:
+        while True:
+            elapsed = time.time() - stats['start_time']
+            rate = stats['tests_run'] / elapsed if elapsed > 0 else 0
+            sys.stdout.write("\033[F\033[K" * 6)
+            print(f"Tests Run     : {stats['tests_run']}")
+            print(f"Crashes Found : {stats['crashes_found']}")
+            print(f"New Findings  : {stats['new_findings']}")
+            print(f"Elapsed Time  : {int(elapsed)}s")
+            print(f"Test Rate     : {rate:.2f} tests/sec")
+            print(f"Goal          : Stop at {MAX_TESTS_WITHOUT_CRASH} without crash")
+            await asyncio.sleep(1)
     except asyncio.CancelledError:
         return
 
@@ -114,7 +158,7 @@ async def main():
     parser.add_argument("--payload", required=True, help="Original payload for mutation")
     parser.add_argument("--headers", default='{}', help="HTTP headers as JSON string")
     parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers")
-    parser.add_argument("--duration", type=int, default=30, help="Duration in seconds to run")
+    parser.add_argument("--duration", type=int, default=60, help="Duration in seconds to run")
     args = parser.parse_args()
 
     try:
@@ -124,18 +168,22 @@ async def main():
         return
 
     connector = aiohttp.TCPConnector(ssl=False)
-    print(f"Starting fuzzer for {args.duration} seconds with {args.workers} workers...")
+    print(f"Starting fuzzer for {args.duration} seconds with {args.workers} workers...\n")
 
     async with aiohttp.ClientSession(connector=connector) as session:
         tasks = [asyncio.create_task(fuzzer_worker(session, args)) for _ in range(args.workers)]
+        stats_task = asyncio.create_task(live_stats_updater())
         try:
             await asyncio.sleep(args.duration)
         finally:
             for task in tasks:
                 task.cancel()
+            stats_task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.gather(stats_task, return_exceptions=True)
 
-    print(f"Fuzzing finished.\nTests Run: {stats['tests_run']} | Crashes: {stats['crashes_found']} | New Findings: {stats['new_findings']}")
+    log_file.close()
+    print(f"\nFuzzing finished.\nTests Run: {stats['tests_run']} | Crashes: {stats['crashes_found']} | New Findings: {stats['new_findings']}")
 
 
 if __name__ == "__main__":
