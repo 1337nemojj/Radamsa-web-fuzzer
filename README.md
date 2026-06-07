@@ -1,5 +1,10 @@
 # Web Service Fuzzer with Radamsa
 
+## Safety Notice
+
+Use this fuzzer only against systems you own or have explicit permission to test.
+Fuzzing can generate high request volume, unexpected input, crashes, and noisy logs. Start with low worker counts and isolated test environments.
+
 ## Prerequisites
 
 - Python 3.x
@@ -68,5 +73,4 @@ options:
 -   **Stopping Conditions** (SOON): The fuzzer automatically stops if:
     -   The total number of tests reaches 100,000.
     -   No new crashes or findings are detected for 2 hours.
-
 
